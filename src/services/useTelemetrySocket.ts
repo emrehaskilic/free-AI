@@ -20,7 +20,14 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
   const reconnectAttempts = useRef(0);
-  const symbolsKey = activeSymbols.join(',');
+  const normalizedSymbols = Array.from(
+    new Set(
+      activeSymbols
+        .map((symbol) => String(symbol || '').trim().toUpperCase())
+        .filter(Boolean)
+    )
+  ).sort();
+  const symbolsKey = normalizedSymbols.join(',');
 
   useEffect(() => {
     let disposed = false;
@@ -28,20 +35,24 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
     reconnectAttempts.current = 0;
 
     const clearReconnectTimer = () => {
-      if (reconnectTimeoutRef.current) {
+      if (reconnectTimeoutRef.current !== null) {
         clearTimeout(reconnectTimeoutRef.current);
         reconnectTimeoutRef.current = null;
       }
     };
 
     const scheduleReconnect = () => {
-      if (disposed || activeSymbols.length === 0) {
+      if (disposed || normalizedSymbols.length === 0) {
+        return;
+      }
+      if (reconnectTimeoutRef.current !== null) {
         return;
       }
       const delay = Math.min(1000 * Math.pow(2, reconnectAttempts.current), maxDelayMs);
       reconnectAttempts.current += 1;
       console.log(`[Telemetry] Reconnecting in ${delay}ms...`);
       reconnectTimeoutRef.current = window.setTimeout(() => {
+        reconnectTimeoutRef.current = null;
         connect();
       }, delay);
     };
@@ -62,7 +73,7 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
     };
 
     const connect = () => {
-      if (disposed || activeSymbols.length === 0) {
+      if (disposed || normalizedSymbols.length === 0) {
         return;
       }
 
@@ -70,7 +81,7 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
       closeActiveSocket('reconnect');
 
       const proxyWs = getProxyWsBase();
-      const url = `${proxyWs}/ws?symbols=${activeSymbols.join(',')}`;
+      const url = `${proxyWs}/ws?symbols=${normalizedSymbols.join(',')}`;
       console.log(`[Telemetry] Connecting to WS: ${url} (attempt ${reconnectAttempts.current + 1})`);
 
       try {
@@ -104,18 +115,19 @@ export function useTelemetrySocket(activeSymbols: string[]): MetricsState {
         };
 
         ws.onclose = (event) => {
-          if (wsRef.current === ws) {
-            wsRef.current = null;
-          }
           if (disposed) {
             return;
           }
+          if (wsRef.current !== ws) {
+            return;
+          }
+          wsRef.current = null;
           console.log(`[Telemetry] WebSocket closed (code: ${event.code})`);
           scheduleReconnect();
         };
 
         ws.onerror = (error) => {
-          if (disposed) {
+          if (disposed || wsRef.current !== ws) {
             return;
           }
           console.error('[Telemetry] WebSocket error:', error);

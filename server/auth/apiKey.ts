@@ -71,7 +71,9 @@ function decodeBase64UrlToken(value: string): string {
 
 function getApiKeyFromWebSocketProtocol(headers: IncomingMessage['headers']): string {
     const raw = headers['sec-websocket-protocol'];
-    const protocolHeader = Array.isArray(raw) ? String(raw[0] || '') : String(raw || '');
+    const protocolHeader = Array.isArray(raw)
+        ? raw.map((value) => String(value || '')).join(',')
+        : String(raw || '');
     if (!protocolHeader) {
         return '';
     }

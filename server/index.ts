@@ -111,6 +111,10 @@ const DEPTH_LEVELS = Number(process.env.DEPTH_LEVELS || 20);
 const DEPTH_STREAM_MODE = String(process.env.DEPTH_STREAM_MODE || 'diff').toLowerCase(); // diff | partial
 const WS_UPDATE_SPEED_RAW = String(process.env.WS_UPDATE_SPEED || '250ms');
 const WS_UPDATE_SPEED = normalizeWsUpdateSpeed(WS_UPDATE_SPEED_RAW);
+const BINANCE_REST_TIMEOUT_MS = Math.max(1000, Number(process.env.BINANCE_REST_TIMEOUT_MS || 8000));
+const BINANCE_EXCHANGE_INFO_TIMEOUT_MS = Math.max(1000, Number(process.env.BINANCE_EXCHANGE_INFO_TIMEOUT_MS || BINANCE_REST_TIMEOUT_MS));
+const BINANCE_SNAPSHOT_TIMEOUT_MS = Math.max(1000, Number(process.env.BINANCE_SNAPSHOT_TIMEOUT_MS || BINANCE_REST_TIMEOUT_MS));
+const SYMBOLS_ENDPOINT_TIMEOUT_MS = Math.max(1000, Number(process.env.SYMBOLS_ENDPOINT_TIMEOUT_MS || 3500));
 const BLOCKED_TELEMETRY_INTERVAL_MS = Number(process.env.BLOCKED_TELEMETRY_INTERVAL_MS || 1000);
 const MIN_RESYNC_INTERVAL_MS = 15000;
 const GRACE_PERIOD_MS = 5000;
@@ -372,6 +376,47 @@ function pruneWindow(values: number[], windowMs: number, now: number): void {
 function countWindow(values: number[], windowMs: number, now: number): number {
     pruneWindow(values, windowMs, now);
     return values.length;
+}
+
+async function fetchWithTimeout(url: string, timeoutMs: number): Promise<globalThis.Response> {
+    const controller = new AbortController();
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    const deadlineMs = Math.max(1000, timeoutMs);
+    const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+            controller.abort();
+            reject(new Error(`fetch_timeout_${deadlineMs}`));
+        }, deadlineMs);
+    });
+    try {
+        return await Promise.race([
+            fetch(url, { signal: controller.signal }),
+            timeoutPromise,
+        ]);
+    } finally {
+        if (timeoutHandle) {
+            clearTimeout(timeoutHandle);
+        }
+    }
+}
+
+function buildSymbolFallbackList(): string[] {
+    const seeds = new Set<string>([
+        'BTCUSDT',
+        'ETHUSDT',
+        'SOLUSDT',
+        'BNBUSDT',
+        ...Array.from(activeSymbols || []),
+        ...dryRunSession.getActiveSymbols(),
+    ]);
+    const cached = exchangeInfoCache?.data?.symbols;
+    if (Array.isArray(cached)) {
+        for (const symbol of cached) {
+            const normalized = String(symbol || '').toUpperCase();
+            if (normalized) seeds.add(normalized);
+        }
+    }
+    return Array.from(seeds).sort();
 }
 
 interface KlineSample1m {
@@ -662,9 +707,10 @@ async function fetchExchangeInfo() {
     if (exchangeInfoCache && (Date.now() - exchangeInfoCache.timestamp < EXCHANGE_INFO_TTL_MS)) {
         return exchangeInfoCache.data;
     }
+    const fallbackSymbols = buildSymbolFallbackList();
     try {
         log('EXCHANGE_INFO_REQ', { url: `${BINANCE_REST_BASE}/fapi/v1/exchangeInfo` });
-        const res = await fetch(`${BINANCE_REST_BASE}/fapi/v1/exchangeInfo`);
+        const res = await fetchWithTimeout(`${BINANCE_REST_BASE}/fapi/v1/exchangeInfo`, BINANCE_EXCHANGE_INFO_TIMEOUT_MS);
         if (!res.ok) throw new Error(`Status ${res.status}`);
         const data: any = await res.json();
         const symbols = data.symbols
@@ -674,7 +720,7 @@ async function fetchExchangeInfo() {
         return exchangeInfoCache.data;
     } catch (e: any) {
         log('EXCHANGE_INFO_ERROR', { error: e.message });
-        return exchangeInfoCache?.data || { symbols: [] };
+        return exchangeInfoCache?.data || { symbols: fallbackSymbols };
     }
 }
 
@@ -701,7 +747,10 @@ async function fetchSnapshot(symbol: string, trigger: string, force = false) {
 
     try {
         log('SNAPSHOT_REQ', { symbol, trigger });
-        const res = await fetch(`${BINANCE_REST_BASE}/fapi/v1/depth?symbol=${symbol}&limit=1000`);
+        const res = await fetchWithTimeout(
+            `${BINANCE_REST_BASE}/fapi/v1/depth?symbol=${symbol}&limit=1000`,
+            BINANCE_SNAPSHOT_TIMEOUT_MS
+        );
 
         meta.lastSnapshotHttpStatus = res.status;
 
@@ -1593,6 +1642,7 @@ function broadcastMetrics(
 // =============================================================================
 
 const app = express();
+app.set('etag', false);
 app.use(express.json());
 app.use(requestLogger);
 
@@ -1622,6 +1672,12 @@ const corsOptions = {
     allowedHeaders: ['Content-Type', 'Authorization'],
 };
 app.use(cors(corsOptions));
+app.use('/api', (_req, res, next) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    next();
+});
 app.use('/api', apiKeyMiddleware);
 app.get(
     ['/health-report.json', '/health_check_result.json', '/server/health-report.json'],
@@ -1741,7 +1797,15 @@ app.get('/api/exchange-info', async (req, res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
-    res.json(await fetchExchangeInfo());
+    const fallbackSymbols = buildSymbolFallbackList();
+    const info = await Promise.race([
+        fetchExchangeInfo(),
+        new Promise<{ symbols: string[] }>((resolve) => {
+            setTimeout(() => resolve({ symbols: fallbackSymbols }), SYMBOLS_ENDPOINT_TIMEOUT_MS);
+        }),
+    ]);
+    const symbols = Array.isArray(info?.symbols) && info.symbols.length > 0 ? info.symbols : fallbackSymbols;
+    res.json({ symbols });
 });
 
 app.get('/api/testnet/exchange-info', async (req, res) => {
@@ -1853,11 +1917,22 @@ app.post('/api/execution/refresh', async (req, res) => {
 
 app.get('/api/dry-run/symbols', async (req, res) => {
     try {
-        const info = await fetchExchangeInfo();
-        const symbols = Array.isArray(info?.symbols) ? info.symbols : [];
+        // Prevent 304/empty-body cache flows on symbol bootstrap requests.
+        res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.set('Pragma', 'no-cache');
+        res.set('Expires', '0');
+
+        const fallbackSymbols = buildSymbolFallbackList();
+        const info = await Promise.race([
+            fetchExchangeInfo(),
+            new Promise<{ symbols: string[] }>((resolve) => {
+                setTimeout(() => resolve({ symbols: fallbackSymbols }), SYMBOLS_ENDPOINT_TIMEOUT_MS);
+            }),
+        ]);
+        const symbols = Array.isArray(info?.symbols) && info.symbols.length > 0 ? info.symbols : fallbackSymbols;
         res.json({ ok: true, symbols });
     } catch (e: any) {
-        res.status(500).json({ ok: false, error: e?.message || 'dry_run_symbols_failed', symbols: [] });
+        res.status(200).json({ ok: true, symbols: buildSymbolFallbackList(), degraded: true });
     }
 });
 

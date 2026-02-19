@@ -85,15 +85,27 @@ export const Dashboard: React.FC = () => {
   useEffect(() => {
     const fetchPairs = async () => {
       try {
-        const res = await fetchWithAuth(`${proxyUrl}/api/exchange-info`);
+        const res = await fetchWithAuth(`${proxyUrl}/api/exchange-info`, { cache: 'no-store' });
+        if (!res.ok) {
+          throw new Error(`exchange_info_http_${res.status}`);
+        }
         const data = await res.json();
-        const pairs = Array.isArray(data?.symbols) ? data.symbols : [];
+        const pairs = Array.isArray(data?.symbols)
+          ? data.symbols.filter((p: unknown): p is string => typeof p === 'string' && p.length > 0)
+          : [];
+        if (pairs.length === 0) {
+          throw new Error('exchange_info_empty');
+        }
         setAvailablePairs(pairs);
         if (pairs.length > 0 && selectedPairs.length === 0) {
           setSelectedPairs([pairs[0]]);
         }
       } catch {
-        setAvailablePairs([]);
+        const fallbackPairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+        setAvailablePairs(fallbackPairs);
+        if (selectedPairs.length === 0) {
+          setSelectedPairs([fallbackPairs[0]]);
+        }
       } finally {
         setIsLoadingPairs(false);
       }
@@ -105,7 +117,7 @@ export const Dashboard: React.FC = () => {
   useEffect(() => {
     const pollStatus = async () => {
       try {
-        const res = await fetchWithAuth(`${proxyUrl}/api/execution/status`);
+        const res = await fetchWithAuth(`${proxyUrl}/api/execution/status`, { cache: 'no-store' });
         const data = (await res.json()) as ExecutionStatus;
         setExecutionStatus(data);
 

@@ -184,10 +184,20 @@ const DryRunDashboard: React.FC = () => {
   useEffect(() => {
     const loadPairs = async () => {
       setIsLoadingPairs(true);
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 8000);
       try {
-        const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/symbols`);
+        const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/symbols`, { signal: controller.signal, cache: 'no-store' });
+        if (!res.ok) {
+          throw new Error(`symbols_http_${res.status}`);
+        }
         const data = await res.json();
-        const pairs = Array.isArray(data?.symbols) ? data.symbols : [];
+        const pairs = Array.isArray(data?.symbols)
+          ? data.symbols.filter((p: unknown): p is string => typeof p === 'string' && p.length > 0)
+          : [];
+        if (pairs.length === 0) {
+          throw new Error('symbols_empty');
+        }
         setAvailablePairs(pairs);
         if (pairs.length > 0) {
           setSelectedPairs((prev) => {
@@ -197,8 +207,15 @@ const DryRunDashboard: React.FC = () => {
           });
         }
       } catch {
-        setAvailablePairs([]);
+        const fallbackPairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+        setAvailablePairs(fallbackPairs);
+        setSelectedPairs((prev) => {
+          const valid = prev.filter((s) => fallbackPairs.includes(s));
+          if (valid.length > 0) return valid;
+          return [fallbackPairs[0]];
+        });
       } finally {
+        window.clearTimeout(timer);
         setIsLoadingPairs(false);
       }
     };
@@ -211,7 +228,7 @@ const DryRunDashboard: React.FC = () => {
 
     const poll = async () => {
       try {
-        const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/status`);
+        const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/status`, { cache: 'no-store' });
         const data = await res.json();
         if (!active) return;
         if (res.ok && data?.status) {
@@ -317,7 +334,7 @@ const DryRunDashboard: React.FC = () => {
     setActionError(null);
     setIsRefreshingPositions(true);
     try {
-      const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/status`);
+      const res = await fetchWithAuth(`${proxyUrl}/api/dry-run/status`, { cache: 'no-store' });
       const data = await res.json();
       if (!res.ok || !data?.status) {
         throw new Error(data?.error || 'dry_run_status_failed');
