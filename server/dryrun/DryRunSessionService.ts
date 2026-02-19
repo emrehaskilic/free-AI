@@ -2,7 +2,6 @@ import { DryRunEngine } from './DryRunEngine';
 import { DryRunConfig, DryRunEventInput, DryRunEventLog, DryRunOrderBook, DryRunOrderRequest, DryRunReasonCode, DryRunStateSnapshot } from './types';
 import { StrategyDecision, StrategyActionType, StrategyPositionState, StrategyRegime, StrategySignal, StrategySide } from '../types/strategy';
 import { AlertService } from '../notifications/AlertService';
-import { RiskGovernorV11 } from '../risk/RiskGovernorV11';
 import { PerformanceCalculator, PerformanceMetrics } from '../metrics/PerformanceCalculator';
 import { SessionStore } from './SessionStore';
 import { LimitOrderStrategy, LimitStrategyMode } from './LimitOrderStrategy';
@@ -291,7 +290,6 @@ const DEFAULT_TRAIL_MIN_HOLD_MS = Math.max(0, Math.trunc(clampNumber(process.env
 const DEFAULT_MAX_SPREAD_PCT = clampNumber(process.env.MAX_SPREAD_PCT, 0.0008, 0, 0.01);
 const DEFAULT_AI_MAX_MARGIN_USAGE_PCT = clampNumber(process.env.AI_MAX_MARGIN_USAGE_PCT, 0.85, 0.3, 0.98);
 const DEFAULT_AI_MAX_POSITION_NOTIONAL = clampNumber(process.env.AI_MAX_POSITION_NOTIONAL_USDT, DEFAULT_MAX_NOTIONAL, 10, 10_000_000);
-const DEFAULT_AI_ADD_RISK_CAP_PCT = clampNumber(process.env.AI_ADD_RISK_CAP_PCT, 0.25, 0.05, 1);
 const DEFAULT_AI_DAILY_LOSS_LOCK_PCT = clampNumber(process.env.AI_DAILY_LOSS_LOCK_PCT, 0.05, 0.005, 0.5);
 
 function parseLimitStrategy(input: string): LimitStrategyMode {
@@ -353,7 +351,6 @@ export class DryRunSessionService {
   private sessions = new Map<string, SymbolSession>();
   private logTail: DryRunConsoleLog[] = [];
   private limitStrategy: LimitOrderStrategy;
-  private readonly riskGovernor = new RiskGovernorV11();
   private readonly alertService?: AlertService;
   private readonly sessionStore: SessionStore;
   private readonly tradeLogger?: DryRunTradeLogger;
@@ -807,7 +804,6 @@ export class DryRunSessionService {
       const urgencyLevel = this.normalizeAIUrgency(aiPlan?.urgency);
       const spreadPct = this.computeSpreadPct(session.lastOrderBook);
       const volatility = session.atr || decision.volLevel || 0;
-      const incrementalRiskCapPct = this.normalizeRiskCapPct((action.metadata as AIActionMetadata | undefined)?.incrementalRiskCapPct);
       const laddersRequested = Math.max(0, Math.min(5, Math.trunc(Number(aiPlan?.maxAdds ?? 2))));
 
       if (action.type === StrategyActionType.ENTRY && desiredOrderSide) {
@@ -815,15 +811,17 @@ export class DryRunSessionService {
         if (position && position.side !== actionSide) {
           const closeQty = roundTo(position.qty, 6);
           if (closeQty > 0) {
-            queueOrder({
-              side: position.side === 'LONG' ? 'SELL' : 'BUY',
-              type: 'MARKET',
-              qty: closeQty,
-              timeInForce: 'IOC',
-              reduceOnly: true,
-              reasonCode: 'AI_REVERSAL_EXIT',
-            });
-            this.addConsoleLog('INFO', normalized, `AI reversal: closing ${position.side} before ${actionSide}`, session.lastEventTimestampMs);
+            const closeOrder = this.buildAiLimitOrder(
+              session,
+              position.side === 'LONG' ? 'SELL' : 'BUY',
+              closeQty,
+              true,
+              'AI_REVERSAL_EXIT'
+            );
+            if (closeOrder) {
+              queueOrder(closeOrder);
+              this.addConsoleLog('INFO', normalized, `AI reversal: closing ${position.side} before ${actionSide}`, session.lastEventTimestampMs);
+            }
           }
         }
 
@@ -831,18 +829,23 @@ export class DryRunSessionService {
           const referencePrice = Number(action.expectedPrice) || session.latestMarkPrice || position.entryPrice;
           const sizing = this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 0.5, {
             mode: 'ADD',
-            incrementalRiskCapPct,
           });
           if (sizing.qty > 0) {
             session.engine.setLeverageOverride(sizing.leverage);
-            queueOrder({
+            const addOrders = this.limitStrategy.buildEntryOrders({
               side: desiredOrderSide,
-              type: 'MARKET',
               qty: sizing.qty,
-              timeInForce: 'IOC',
-              reduceOnly: false,
-              reasonCode: 'AI_ADD',
+              markPrice: referencePrice,
+              orderBook: session.lastOrderBook,
+              entryStyle: 'LIMIT',
+              urgencyLevel,
+              spreadPct,
+              volatility,
+              ladderCount: laddersRequested,
             });
+            for (const order of addOrders) {
+              queueOrder({ ...order, reasonCode: 'AI_ADD' });
+            }
             session.addOnState.count += 1;
             session.addOnState.lastAddOnTs = decisionTs;
             this.addConsoleLog('INFO', normalized, `AI add ${actionSide} +${sizing.qty}`, session.lastEventTimestampMs);
@@ -883,7 +886,6 @@ export class DryRunSessionService {
         const referencePrice = Number(action.expectedPrice) || session.latestMarkPrice || currentPosition.entryPrice;
         const sizing = this.computeRiskSizing(session, referencePrice, decision.regime, action.sizeMultiplier || 0.5, {
           mode: 'ADD',
-          incrementalRiskCapPct,
         });
         if (!(sizing.qty > 0)) continue;
         session.engine.setLeverageOverride(sizing.leverage);
@@ -911,31 +913,35 @@ export class DryRunSessionService {
         const reducePct = clampNumber(Number(action.reducePct ?? 0.5), 0.5, 0.1, 1);
         const reduceQty = roundTo(position.qty * reducePct, 6);
         if (!(reduceQty > 0)) continue;
-        queueOrder({
-          side: position.side === 'LONG' ? 'SELL' : 'BUY',
-          type: 'MARKET',
-          qty: reduceQty,
-          timeInForce: 'IOC',
-          reduceOnly: true,
-          reasonCode: 'AI_REDUCE',
-        });
-        this.addConsoleLog('INFO', normalized, `AI reduce ${position.side} -${reduceQty} (${(reducePct * 100).toFixed(0)}%)`, session.lastEventTimestampMs);
+        const reduceOrder = this.buildAiLimitOrder(
+          session,
+          position.side === 'LONG' ? 'SELL' : 'BUY',
+          reduceQty,
+          true,
+          'AI_REDUCE'
+        );
+        if (reduceOrder) {
+          queueOrder(reduceOrder);
+          this.addConsoleLog('INFO', normalized, `AI reduce ${position.side} -${reduceQty} (${(reducePct * 100).toFixed(0)}%)`, session.lastEventTimestampMs);
+        }
         continue;
       }
 
       if (action.type === StrategyActionType.EXIT && position) {
         const exitQty = roundTo(position.qty, 6);
         if (!(exitQty > 0)) continue;
-        queueOrder({
-          side: position.side === 'LONG' ? 'SELL' : 'BUY',
-          type: 'MARKET',
-          qty: exitQty,
-          timeInForce: 'IOC',
-          reduceOnly: true,
-          reasonCode: 'AI_EXIT',
-        });
-        this.addConsoleLog('INFO', normalized, `AI exit ${position.side} completely`, session.lastEventTimestampMs);
-        session.pendingExitReason = action.reason;
+        const exitOrder = this.buildAiLimitOrder(
+          session,
+          position.side === 'LONG' ? 'SELL' : 'BUY',
+          exitQty,
+          true,
+          'AI_EXIT'
+        );
+        if (exitOrder) {
+          queueOrder(exitOrder);
+          this.addConsoleLog('INFO', normalized, `AI exit ${position.side} completely`, session.lastEventTimestampMs);
+          session.pendingExitReason = action.reason;
+        }
       }
     }
 
@@ -992,8 +998,8 @@ export class DryRunSessionService {
       : 0;
     const equityStart = this.config.walletBalanceStartUsdt;
     const drawdownPct = equityStart > 0 ? (equity - equityStart) / equityStart : 0;
-    const dailyLossLock = drawdownPct <= -Math.abs(DEFAULT_AI_DAILY_LOSS_LOCK_PCT) || session.lastState.marginHealth <= 0.05;
-    const cooldownMsRemaining = this.getHoldRemainingMs(session, nowMs);
+    const dailyLossLock = false;
+    const cooldownMsRemaining = 0;
 
     return {
       equity: roundTo(equity, 8),
@@ -1986,6 +1992,36 @@ export class DryRunSessionService {
     return mid > 0 ? (bestAsk - bestBid) / mid : null;
   }
 
+  private buildAiLimitOrder(
+    session: SymbolSession,
+    side: 'BUY' | 'SELL',
+    qty: number,
+    reduceOnly: boolean,
+    reasonCode: DryRunReasonCode
+  ): DryRunOrderRequest | null {
+    if (!(qty > 0)) return null;
+    const bestBid = Number(session.lastOrderBook.bids?.[0]?.price || 0);
+    const bestAsk = Number(session.lastOrderBook.asks?.[0]?.price || 0);
+    const mark = Number(session.latestMarkPrice || 0);
+    let price = side === 'BUY' ? bestAsk : bestBid;
+    if (!(price > 0)) {
+      price = mark;
+    }
+    if (!(price > 0)) {
+      return null;
+    }
+    return {
+      side,
+      type: 'LIMIT',
+      qty: roundTo(qty, 6),
+      price: roundTo(price, 6),
+      timeInForce: 'IOC',
+      reduceOnly,
+      postOnly: false,
+      reasonCode,
+    };
+  }
+
   private extractAIPlan(metadata?: Record<string, unknown>): AIIntentMetadata | null {
     if (!metadata || typeof metadata !== 'object') return null;
     const candidate = (metadata as AIActionMetadata).plan;
@@ -1994,11 +2030,7 @@ export class DryRunSessionService {
   }
 
   private normalizeAIEntryStyle(value?: string): 'LIMIT' | 'MARKET_SMALL' | 'HYBRID' {
-    const normalized = String(value || '').trim().toUpperCase();
-    if (normalized === 'LIMIT' || normalized === 'MARKET_SMALL' || normalized === 'HYBRID') {
-      return normalized;
-    }
-    return 'HYBRID';
+    return 'LIMIT';
   }
 
   private normalizeAIUrgency(value?: string): 'LOW' | 'MED' | 'HIGH' {
@@ -2007,12 +2039,6 @@ export class DryRunSessionService {
       return normalized;
     }
     return 'MED';
-  }
-
-  private normalizeRiskCapPct(value?: number): number {
-    const n = Number(value);
-    if (!Number.isFinite(n)) return DEFAULT_AI_ADD_RISK_CAP_PCT;
-    return Math.max(0.05, Math.min(1, n));
   }
 
   private computePositionTimeInMs(session: SymbolSession, nowMs: number): number {
@@ -2038,45 +2064,18 @@ export class DryRunSessionService {
     options?: { mode?: 'ENTRY' | 'ADD'; incrementalRiskCapPct?: number }
   ): { qty: number; leverage: number } {
     if (!this.config || !(price > 0)) return { qty: 0, leverage: session.dynamicLeverage || 1 };
-    const sizingMode = options?.mode === 'ADD' ? 'ADD' : 'ENTRY';
     const leverage = session.dynamicLeverage || this.config.leverage || 1;
-    const unrealized = this.computeUnrealizedPnl(session);
-    const effectiveEquity = Math.max(0, session.lastState.walletBalance + unrealized);
-    const res = this.riskGovernor.compute({
-      equity: effectiveEquity,
-      price,
-      vwap: session.latestMarkPrice || price,
-      volatility: session.atr || 0,
-      regime,
-      liquidationDistance: null,
-    });
 
-    const baseQty = Math.max(0, res.qty * Math.max(0.05, sizeMultiplier));
-    if (!(baseQty > 0)) return { qty: 0, leverage };
-
+    const normalizedMultiplier = Math.max(0.05, Math.min(2, Number(sizeMultiplier || 1)));
+    const baseMarginUsdt = Math.max(1, Number(this.config.initialMarginUsdt || 0));
     const positionNotional = session.lastState.position ? Math.abs(session.lastState.position.qty * price) : 0;
-    const marginBoundNotional = effectiveEquity > 0
-      ? effectiveEquity * leverage * DEFAULT_AI_MAX_MARGIN_USAGE_PCT
-      : 0;
-    const userMinEntryNotional = Math.max(0, this.config.initialMarginUsdt * leverage);
-    const configuredMaxNotional = sizingMode === 'ENTRY'
-      ? Math.max(DEFAULT_AI_MAX_POSITION_NOTIONAL, userMinEntryNotional)
-      : DEFAULT_AI_MAX_POSITION_NOTIONAL;
-    const maxNotional = Math.max(0, Math.min(configuredMaxNotional, marginBoundNotional || configuredMaxNotional));
-    const remainingNotional = Math.max(0, maxNotional - positionNotional);
-    if (!(remainingNotional > 0)) return { qty: 0, leverage };
-
-    const addMode = sizingMode === 'ADD';
-    const addRiskCapPct = this.normalizeRiskCapPct(options?.incrementalRiskCapPct);
-    const addNotionalCap = addMode ? remainingNotional * addRiskCapPct : remainingNotional;
-    const targetNotional = addMode
-      ? (baseQty * price)
-      : Math.max(baseQty * price, userMinEntryNotional);
-    const cappedNotional = Math.max(0, Math.min(targetNotional, remainingNotional, addNotionalCap));
-    if (!addMode && userMinEntryNotional > 0 && cappedNotional < (userMinEntryNotional * 0.999)) {
-      return { qty: 0, leverage };
-    }
-    const qty = roundTo(Math.max(0, cappedNotional / price), 6);
+    const targetMargin = baseMarginUsdt * normalizedMultiplier;
+    const targetNotional = Math.max(0, targetMargin * leverage);
+    const desiredNotional = options?.mode === 'ADD'
+      ? targetNotional
+      : Math.max(targetNotional, baseMarginUsdt * leverage);
+    const openingNotional = Math.max(0, desiredNotional - positionNotional);
+    const qty = roundTo(Math.max(0, openingNotional / price), 6);
     return { qty, leverage };
   }
 

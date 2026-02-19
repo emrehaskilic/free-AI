@@ -1356,9 +1356,6 @@ async function processSymbolEvent(s: string, d: any) {
                 const riskState = dryRunSession.getAIDryRunRiskState(s, snapshotTs);
                 const executionState = dryRunSession.getAIDryRunExecutionState(s, snapshotTs);
                 const blockedReasons: string[] = [];
-                if (!decision.gatePassed) blockedReasons.push('GATE_NOT_PASSED');
-                if (spreadPct != null && spreadPct > 0.6) blockedReasons.push('SPREAD_TOO_WIDE');
-                if (tasMetrics && (tasMetrics.printsPerSecond < 0.25 || tasMetrics.tradeCount < 4)) blockedReasons.push('ACTIVITY_WEAK');
 
                 void aiDryRun.onMetrics({
                     symbol: s,
@@ -1959,9 +1956,18 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             return;
         }
 
-        const apiKey = String(req.body?.apiKey || '').trim();
-        const model = String(req.body?.model || '').trim();
-        const localOnly = Boolean(req.body?.localOnly) || !apiKey || !model;
+        const apiKey = String(
+            process.env.GOOGLE_AI_API_KEY
+            || process.env.AI_API_KEY
+            || process.env.GEMINI_API_KEY
+            || ''
+        ).trim();
+        const model = String(
+            process.env.GOOGLE_AI_MODEL
+            || process.env.AI_MODEL
+            || 'gemini-2.5-flash'
+        ).trim();
+        const localOnly = !apiKey;
 
         const info = await fetchExchangeInfo();
         const symbols = Array.isArray(info?.symbols) ? info.symbols : [];
@@ -2004,9 +2010,9 @@ app.post('/api/ai-dry-run/start', async (req, res) => {
             symbols: symbolsRequested,
             apiKey,
             model,
-            decisionIntervalMs: Number(req.body?.decisionIntervalMs ?? 2000),
+            decisionIntervalMs: Number(process.env.AI_DECISION_INTERVAL_MS ?? 250),
             temperature: Number(req.body?.temperature ?? 0),
-            maxOutputTokens: Number(req.body?.maxOutputTokens ?? 256),
+            maxOutputTokens: Number(process.env.AI_MAX_OUTPUT_TOKENS ?? 512),
             localOnly,
             bootstrapTrendBySymbol,
         });

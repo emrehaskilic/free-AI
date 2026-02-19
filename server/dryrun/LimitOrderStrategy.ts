@@ -142,7 +142,7 @@ export class LimitOrderStrategy {
           type: 'LIMIT',
           qty: roundTo(params.qty, 6),
           price: roundTo(params.markPrice, 6),
-          timeInForce: 'GTC',
+          timeInForce: 'IOC',
           reduceOnly: false,
           postOnly: false,
         }];
@@ -182,7 +182,21 @@ export class LimitOrderStrategy {
     );
     const spacingBps = this.computeSpacingBps(params.spreadPct, params.volatility);
 
-    if (params.entryStyle === 'LIMIT' || ladderCount === 0) {
+    if (params.entryStyle === 'LIMIT') {
+      const immediatePrice = params.side === 'BUY' ? bestAsk : bestBid;
+      orders.push({
+        side: params.side,
+        type: 'LIMIT',
+        qty: remainingQty,
+        price: roundTo(immediatePrice, 6),
+        timeInForce: 'IOC',
+        reduceOnly: false,
+        postOnly: false,
+      });
+      return orders;
+    }
+
+    if (ladderCount === 0) {
       const passiveOffset = this.config.passiveOffsetBps / 10_000;
       const price = params.side === 'BUY'
         ? bestBid * (1 - passiveOffset)

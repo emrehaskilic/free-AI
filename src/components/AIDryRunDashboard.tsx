@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import SymbolRow from './SymbolRow';
 import MobileSymbolCard from './MobileSymbolCard';
 import { useTelemetrySocket } from '../services/useTelemetrySocket';
@@ -165,20 +165,6 @@ const formatTs = (ts: number): string => {
   return new Date(ts).toLocaleTimeString();
 };
 
-const MODEL_OPTIONS = [
-  // Gemini 3 (Latest)
-  { value: 'gemini-3-pro-preview', label: 'Gemini 3 Pro Preview' },
-  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview' },
-  // Gemini 2.5 (Stable)
-  { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro (Stable)' },
-  { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash (Stable)' },
-  { value: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash-Lite (Stable)' },
-  // Gemini 2.0 (Deprecated March 2026)
-  { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash' },
-  // Custom
-  { value: 'custom', label: 'Custom Model' },
-];
-
 const AIDryRunDashboard: React.FC = () => {
   const proxyUrl = getProxyApiBase();
   const fetchWithAuth = (url: string, init?: RequestInit) => fetch(url, withProxyApiKey(init));
@@ -193,16 +179,8 @@ const AIDryRunDashboard: React.FC = () => {
   const [status, setStatus] = useState<DryRunStatus>(DEFAULT_STATUS);
   const [aiStatus, setAiStatus] = useState<AIDryRunStatus | null>(null);
 
-  const [startBalance, setStartBalance] = useState('5000');
   const [initialMargin, setInitialMargin] = useState('200');
   const [leverage, setLeverage] = useState('10');
-  const [apiKey, setApiKey] = useState('');
-  const [model, setModel] = useState('gemini-2.5-flash');
-  const [customModel, setCustomModel] = useState('');
-  const [localMode, setLocalMode] = useState(false);
-  const localModeManualOverrideRef = useRef(false);
-  const [apiKeyStatus, setApiKeyStatus] = useState<'idle' | 'validating' | 'valid' | 'invalid'>('idle');
-  const [apiKeyError, setApiKeyError] = useState<string | null>(null);
   const [lastMetricsUpdateMs, setLastMetricsUpdateMs] = useState(0);
   const [isRefreshingPositions, setIsRefreshingPositions] = useState(false);
 
@@ -273,19 +251,9 @@ const AIDryRunDashboard: React.FC = () => {
           const nextAi = (data?.ai || null) as AIDryRunStatus | null;
           setStatus(next);
           setAiStatus(nextAi);
-          if (nextAi && typeof nextAi.localOnly === 'boolean') {
-            const shouldApplyServerLocalOnly = next.running || !localModeManualOverrideRef.current;
-            if (shouldApplyServerLocalOnly) {
-              setLocalMode(nextAi.localOnly);
-              if (next.running) {
-                localModeManualOverrideRef.current = false;
-              }
-            }
-          }
           if (next.running && next.symbols.length > 0) {
             setSelectedPairs(next.symbols);
           } else if (!next.running && next.config) {
-            setStartBalance(String(next.config.walletBalanceStartUsdt));
             setInitialMargin(String(next.config.initialMarginUsdt));
             setLeverage(String(next.config.leverage));
           }
@@ -323,21 +291,13 @@ const AIDryRunDashboard: React.FC = () => {
       if (selectedPairs.length === 0) {
         throw new Error('at_least_one_pair_required');
       }
-      const resolvedModel = model === 'custom' ? customModel.trim() : model;
-      if (!localMode && (!apiKey.trim() || !resolvedModel)) {
-        throw new Error('ai_api_key_and_model_required');
-      }
       const res = await fetchWithAuth(`${proxyUrl}/api/ai-dry-run/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           symbols: selectedPairs,
-          walletBalanceStartUsdt: Number(startBalance),
           initialMarginUsdt: Number(initialMargin),
           leverage: Number(leverage),
-          apiKey: localMode ? '' : apiKey.trim(),
-          model: localMode ? '' : resolvedModel,
-          localOnly: localMode,
         }),
       });
       const data = await res.json();
@@ -347,10 +307,6 @@ const AIDryRunDashboard: React.FC = () => {
       setStatus((data?.status || DEFAULT_STATUS) as DryRunStatus);
       const nextAi = (data?.ai || null) as AIDryRunStatus | null;
       setAiStatus(nextAi);
-      if (nextAi && typeof nextAi.localOnly === 'boolean') {
-        setLocalMode(nextAi.localOnly);
-        localModeManualOverrideRef.current = false;
-      }
     } catch (e: any) {
       setActionError(e?.message || 'ai_dry_run_start_failed');
     }
@@ -365,9 +321,6 @@ const AIDryRunDashboard: React.FC = () => {
       setStatus((data?.status || DEFAULT_STATUS) as DryRunStatus);
       const nextAi = (data?.ai || null) as AIDryRunStatus | null;
       setAiStatus(nextAi);
-      if (nextAi && typeof nextAi.localOnly === 'boolean') {
-        setLocalMode(nextAi.localOnly);
-      }
     } catch (e: any) {
       setActionError(e?.message || 'ai_dry_run_stop_failed');
     }
@@ -382,9 +335,6 @@ const AIDryRunDashboard: React.FC = () => {
       setStatus((data?.status || DEFAULT_STATUS) as DryRunStatus);
       const nextAi = (data?.ai || null) as AIDryRunStatus | null;
       setAiStatus(nextAi);
-      if (nextAi && typeof nextAi.localOnly === 'boolean') {
-        setLocalMode(nextAi.localOnly);
-      }
     } catch (e: any) {
       setActionError(e?.message || 'ai_dry_run_reset_failed');
     }
@@ -410,38 +360,10 @@ const AIDryRunDashboard: React.FC = () => {
     }
   };
 
-  const validateApiKey = async () => {
-    const key = apiKey.trim();
-    if (!key) {
-      setApiKeyStatus('invalid');
-      setApiKeyError('API key is empty');
-      return;
-    }
-    setApiKeyStatus('validating');
-    setApiKeyError(null);
-    try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`
-      );
-      if (res.ok) {
-        setApiKeyStatus('valid');
-        setApiKeyError(null);
-      } else {
-        const data = await res.json().catch(() => ({}));
-        setApiKeyStatus('invalid');
-        setApiKeyError(data?.error?.message || `HTTP ${res.status}`);
-      }
-    } catch (e: any) {
-      setApiKeyStatus('invalid');
-      setApiKeyError(e?.message || 'Network error');
-    }
-  };
-
   const summary = status.summary;
   const perf = summary.performance || DEFAULT_STATUS.summary.performance!;
   const marginHealthPct = summary.marginHealth * 100;
   const symbolRows = useMemo(() => Object.values(status.perSymbol), [status.perSymbol]);
-  const effectiveLocalMode = status.running ? Boolean(aiStatus?.localOnly) : localMode;
   const telemetryLagMs = lastMetricsUpdateMs > 0 ? Date.now() - lastMetricsUpdateMs : Number.POSITIVE_INFINITY;
   const telemetryConnection = telemetryLagMs < 3_000 ? 'CONNECTED' : telemetryLagMs < 10_000 ? 'STALE' : 'DISCONNECTED';
   const telemetryTone = telemetryConnection === 'CONNECTED'
@@ -472,9 +394,6 @@ const AIDryRunDashboard: React.FC = () => {
             {status.runId && <span className="text-zinc-500 ml-2">{status.runId}</span>}
             {aiStatus?.model && (
               <span className="text-zinc-500 ml-2">AI: {aiStatus.model}</span>
-            )}
-            {effectiveLocalMode && (
-              <span className="text-zinc-500 ml-2">MODE: LOCAL_POLICY</span>
             )}
             <span className={`ml-2 ${telemetryTone}`}>WS: {telemetryConnection}</span>
             <span className="text-zinc-500 ml-2">
@@ -530,19 +449,7 @@ const AIDryRunDashboard: React.FC = () => {
             )}
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            <label className="text-xs text-zinc-500">
-              Start Balance (USDT)
-              <input
-                type="number"
-                min={1}
-                value={startBalance}
-                disabled={status.running}
-                onChange={(e) => setStartBalance(e.target.value)}
-                className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm font-mono"
-              />
-            </label>
-
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <label className="text-xs text-zinc-500">
               Initial Margin (USDT)
               <input
@@ -569,83 +476,10 @@ const AIDryRunDashboard: React.FC = () => {
             </label>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="text-xs text-zinc-500">
-              <label className="mb-2 flex items-center gap-2 text-[11px] text-zinc-400">
-                <input
-                  type="checkbox"
-                  checked={localMode}
-                  disabled={status.running}
-                  onChange={(e) => {
-                    localModeManualOverrideRef.current = true;
-                    setLocalMode(e.target.checked);
-                  }}
-                  className="accent-zinc-300"
-                />
-                Use local autonomous policy (no external AI call)
-              </label>
-              Google AI API Key
-              <div className="flex gap-2 mt-1">
-                <input
-                  type="password"
-                  value={apiKey}
-                  disabled={status.running || localMode}
-                  onChange={(e) => { setApiKey(e.target.value); setApiKeyStatus('idle'); setApiKeyError(null); }}
-                  placeholder={localMode ? 'Local mode active' : 'AIza...'}
-                  className="flex-1 bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm font-mono"
-                />
-                <button
-                  onClick={validateApiKey}
-                  disabled={status.running || localMode || apiKeyStatus === 'validating' || !apiKey.trim()}
-                  className={`px-3 py-2 rounded text-xs font-bold whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed transition-colors ${apiKeyStatus === 'valid'
-                    ? 'bg-emerald-700 text-white'
-                    : apiKeyStatus === 'invalid'
-                      ? 'bg-red-700 text-white'
-                      : 'bg-zinc-700 hover:bg-zinc-600 text-zinc-200 border border-zinc-600'
-                    }`}
-                >
-                  {apiKeyStatus === 'validating' ? '⏳ Checking...' : apiKeyStatus === 'valid' ? '✓ Valid' : apiKeyStatus === 'invalid' ? '✗ Invalid' : 'Validate Key'}
-                </button>
-              </div>
-              {apiKeyStatus === 'valid' && (
-                <div className="text-emerald-400 text-[11px] mt-1">✓ API key is valid and ready to use.</div>
-              )}
-              {localMode && (
-                <div className="text-zinc-500 text-[11px] mt-1">Local mode aktif: kararlar metrik tabanli policy ile uretilir.</div>
-              )}
-              {apiKeyStatus === 'invalid' && apiKeyError && (
-                <div className="text-red-400 text-[11px] mt-1">✗ {apiKeyError}</div>
-              )}
-            </div>
-
-            <label className="text-xs text-zinc-500">
-              Google AI Model
-              <select
-                value={model}
-                disabled={status.running || localMode}
-                onChange={(e) => setModel(e.target.value)}
-                className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm"
-              >
-                {MODEL_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
-            </label>
+          <div className="text-xs text-zinc-500">
+            AI configuration is handled on the server. Select symbols, initial margin and leverage, then start.
           </div>
 
-          {model === 'custom' && (
-            <label className="text-xs text-zinc-500">
-              Custom Model ID
-              <input
-                type="text"
-                value={customModel}
-                disabled={status.running || localMode}
-                onChange={(e) => setCustomModel(e.target.value)}
-                placeholder="models/your-model"
-                className="mt-1 w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-2 text-sm font-mono"
-              />
-            </label>
-          )}
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
             <button
@@ -910,3 +744,4 @@ const AIDryRunDashboard: React.FC = () => {
 };
 
 export default AIDryRunDashboard;
+
